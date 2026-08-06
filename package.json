@@ -1,10 +1,11 @@
 {
   "name": "untitledapigateway",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "gateway.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "type": "module",
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -16,7 +17,7 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^26.1.2",
-    "ts-node": "^10.9.2",
+    "tsx": "^4.23.8",
     "typescript": "^7.0.2"
   }
 }
