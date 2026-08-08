@@ -1,0 +1,10 @@
+{
+  "/api/users": {
+    "target": "http://localhost:5001",
+    "rewritePrefix": ""
+  },
+  "/api/payments": {
+    "target": "http://localhost:5002",
+    "rewritePrefix": ""
+  }
+}

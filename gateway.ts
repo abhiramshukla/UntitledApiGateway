@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import { createProxyMiddleware } from "http-proxy-middleware";
 import { createClient } from "redis";
+import fs from "fs";
 
 const PORT = 8080;
 
@@ -45,13 +46,49 @@ const redisRateLimiter = async (req: Request, res: Response, next: NextFunction)
     }
 };
 
-const apiProxy = createProxyMiddleware({
-    target: 'http://localhost:5001',
-    changeOrigin: true,
-    pathRewrite: {
-        '^/api': '',
-    },
-});
+enum CircuitState { CLOSED, OPEN, HALF_OPEN }
+
+class CircuitBreaker {
+    state: CircuitState = CircuitState.CLOSED;
+    failureCount = 0;
+    failureThreshold = 3;
+    resetTimeout = 15000;
+    nextAttempt = Date.now();
+
+    middleware = (req: Request, res: Response, next: NextFunction) => {
+        if (this.state === CircuitState.OPEN) {
+            if (Date.now() > this.nextAttempt) {
+                this.state = CircuitState.HALF_OPEN;
+                console.log(`Circuit Half Open: Testing Backend`);
+            } else {
+                res.status(503).json({ error: 'Existence is pain, and apparently so is this server'});
+                return;
+            }
+        }
+
+        next();
+    };
+
+    onSuccess() {
+        if (this.state !== CircuitState.CLOSED) console.log('Circuit is CLOSED, backend recovered');
+        this.failureCount = 0;
+        this.state = CircuitState.CLOSED;
+    }
+
+    onFailure() {
+        this.failureCount++;
+        console.log(`Backend failure ${this.failureCount}/${this.failureThreshold}`);
+        if (this.failureCount >= this.failureThreshold && this.state === CircuitState.CLOSED) {
+            this.state = CircuitState.OPEN;
+            this.nextAttempt = Date.now() + this.resetTimeout;
+            console.log(`Circuit Tripped! Pausing traffic.`);
+        } else if (this.state === CircuitState.HALF_OPEN) {
+            this.state = CircuitState.OPEN;
+            this.nextAttempt = Date.now() + this.resetTimeout;
+            console.log(`Circuit test failed. Re-opening.`);
+        }
+    }
+}
 
 const startGateway = async () => {
     await redisClient.connect();
@@ -59,7 +96,37 @@ const startGateway = async () => {
 
     const app = express();
 
-    app.use('/api', authMiddleware, redisRateLimiter, apiProxy);
+    app.use(authMiddleware);
+    app.use(redisRateLimiter);
+
+    const routesRaw = fs.readFileSync('./routes.json', 'utf-8');
+    const routes = JSON.parse(routesRaw);
+
+    for (const [path, config] of Object.entries(routes)) {
+        const routeConfig = config as { target: string, rewritePrefix: string };
+        const breaker = new CircuitBreaker();
+        
+        const proxy = createProxyMiddleware({
+            target: routeConfig.target,
+            changeOrigin: true,
+            pathRewrite: { [`^${path}`]: routeConfig.rewritePrefix },
+            on: {
+                error: (err, req, res) => {
+                    breaker.onFailure();
+                    const altRes = res as Response; // Courtesy http-proxy-middleware version 3.x
+                    altRes.status(502).json({ error: 'I have consulted the gateway. It has failed us.' });
+                },
+                proxyRes: (proxyRes, req, res) => {
+                    if (proxyRes.statusCode && proxyRes.statusCode >= 500) breaker.onFailure();
+                    else breaker.onSuccess();
+                }
+            }
+            
+        });
+
+        app.use(path, breaker.middleware, proxy);
+        console.log(`Mapped ${path} -> ${routeConfig.target}`);
+    }
 
     app.listen(PORT, () => {
         console.log(`UntitledAPIGateway running on http://localhost:${PORT}`);
