@@ -48,6 +48,11 @@ const redisRateLimiter = async (req: Request, res: Response, next: NextFunction)
 
 enum CircuitState { CLOSED, OPEN, HALF_OPEN }
 
+/* 
+NOTE TO SELF:
+After adding the Load Balancing Logic, it would make more sense to have the 
+separate circuit breakers for EVERY INDIVIDUAL target inside the array.
+*/
 class CircuitBreaker {
     state: CircuitState = CircuitState.CLOSED;
     failureCount = 0;
@@ -103,13 +108,21 @@ const startGateway = async () => {
     const routes = JSON.parse(routesRaw);
 
     for (const [path, config] of Object.entries(routes)) {
-        const routeConfig = config as { target: string, rewritePrefix: string };
+        const routeConfig = config as { targets: string[], rewritePrefix: string };
         const breaker = new CircuitBreaker();
+
+        let currentIndex = 0;
         
         const proxy = createProxyMiddleware({
-            target: routeConfig.target,
+            target: routeConfig.targets[0],
             changeOrigin: true,
             pathRewrite: { [`^${path}`]: routeConfig.rewritePrefix },
+            router: (req) => {
+                const target = routeConfig.targets[currentIndex];
+                currentIndex = (currentIndex + 1) % routeConfig.targets.length;
+                console.log(`[Load Balancer] Routing Request to: ${target}`);
+                return target;
+            },
             on: {
                 error: (err, req, res) => {
                     breaker.onFailure();
@@ -125,7 +138,7 @@ const startGateway = async () => {
         });
 
         app.use(path, breaker.middleware, proxy);
-        console.log(`Mapped ${path} -> ${routeConfig.target}`);
+        console.log(`Mapped ${path} -> Load Balancing across ${routeConfig.targets.length} targets`);
     }
 
     app.listen(PORT, () => {
