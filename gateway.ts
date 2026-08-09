@@ -1,12 +1,46 @@
 import express, { type Request, type Response, type NextFunction } from "express";
 import { legacyCreateProxyMiddleware, responseInterceptor } from "http-proxy-middleware";
 import { createClient } from "redis";
+import client from "prom-client";
 import fs from "fs";
 
 const PORT = 8080;
+const app = express();
 
 const redisClient = createClient({url: 'redis://127.0.0.1:6379'});
 redisClient.on('error', (err) => console.error('Redis Client Error', err));
+
+client.collectDefaultMetrics();
+
+const cacheMetrics = new client.Counter({
+    name: 'gateway_cache_operations_total',
+    help: 'Total cache hits and misses',
+    labelNames: ['result']
+});
+
+const circuitBreakerMetrics = new client.Counter({
+    name: 'gateway_cache_operations_total',
+    help: 'Total cache hits and misses',
+    labelNames: ['route']
+});
+
+const responseTimeHistogram = new client.Histogram({
+    name: 'gateway_request_duration_seconds',
+    help: 'Duration of HTTP requests in seconds',
+    labelNames: ['method', 'route', 'status_code'],
+    buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5]
+});
+
+const metricsMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+    const end = responseTimeHistogram.startTimer();
+
+    res.on('finish', () => {
+        const route = req.originalUrl.split('?')[0] || ""; //Fallback to ensure typesafety
+        end({ method: req.method, route: route, status_code: res.statusCode });
+    });
+
+    next();
+}
 
 const authMiddleware = (req: Request, res: Response, next: NextFunction): void => {
     const apiKey = req.headers['x-api-key'];
@@ -86,6 +120,7 @@ class CircuitBreaker {
         if (this.failureCount >= this.failureThreshold && this.state === CircuitState.CLOSED) {
             this.state = CircuitState.OPEN;
             this.nextAttempt = Date.now() + this.resetTimeout;
+            circuitBreakerMetrics.inc({ route: 'dynamic_route' });
             console.log(`Circuit Tripped! Pausing traffic.`);
         } else if (this.state === CircuitState.HALF_OPEN) {
             this.state = CircuitState.OPEN;
@@ -109,6 +144,7 @@ const cacheMiddleware = async (req: Request, res: Response, next: NextFunction):
 
         if(cachedData) {
             console.log(`[Cache Hit] Serving ${req.originalUrl} from Redis`);
+            cacheMetrics.inc({ result: 'hit' });
             res.setHeader('X-Cache', 'HIT');
             res.setHeader('Content-Type', 'application/json');
             res.send(cachedData);
@@ -116,6 +152,7 @@ const cacheMiddleware = async (req: Request, res: Response, next: NextFunction):
         }
 
         console.log(`[Cache Miss] Fetching ${req.originalUrl} from Backend`);
+        cacheMetrics.inc({ result: 'miss' });
         res.setHeader('X-Cache', 'MISS');
         next();
     } catch (err) {
@@ -124,16 +161,7 @@ const cacheMiddleware = async (req: Request, res: Response, next: NextFunction):
     }
 };
 
-const startGateway = async () => {
-    await redisClient.connect();
-    console.log('Connected to Redis');
-
-    const app = express();
-
-    app.use(authMiddleware);
-    app.use(redisRateLimiter);
-    app.use(cacheMiddleware);
-
+const setupDynamicRoutes = () => {
     const routesRaw = fs.readFileSync('./routes.json', 'utf-8');
     const routes = JSON.parse(routesRaw);
 
@@ -181,9 +209,29 @@ const startGateway = async () => {
         app.use(path, breaker.middleware, proxy);
         console.log(`Mapped ${path} -> Load Balancing across ${routeConfig.targets.length} targets`);
     }
+}
+
+const startGateway = async () => {
+    await redisClient.connect();
+    console.log('Connected to Redis');
+
+    
+
+    app.use(metricsMiddleware);
+    app.get('/metric', async (req: Request, res: Response) => {
+        res.set('Content-Type', client.register.contentType);
+        res.send(await client.register.metrics());
+    })
+
+    app.use(authMiddleware);
+    app.use(redisRateLimiter);
+    app.use(cacheMiddleware);
+
+    setupDynamicRoutes();
 
     app.listen(PORT, () => {
         console.log(`UntitledAPIGateway running on http://localhost:${PORT}`);
+        console.log(`Metrics available at http://localhost:${PORT}/metrics`);
     });
 
 };
