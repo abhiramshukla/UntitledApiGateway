@@ -1,5 +1,5 @@
 import express, { type Request, type Response, type NextFunction } from "express";
-import { createProxyMiddleware } from "http-proxy-middleware";
+import { legacyCreateProxyMiddleware, responseInterceptor } from "http-proxy-middleware";
 import { createClient } from "redis";
 import fs from "fs";
 
@@ -95,6 +95,35 @@ class CircuitBreaker {
     }
 }
 
+const CACHE_TTL = 30;
+
+const cacheMiddleware = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if(req.method !== 'GET') {
+        return next();
+    }
+
+    const cacheKey = `cache:${req.originalUrl}`;
+
+    try {
+        const cachedData = await redisClient.get(cacheKey);
+
+        if(cachedData) {
+            console.log(`[Cache Hit] Serving ${req.originalUrl} from Redis`);
+            res.setHeader('X-Cache', 'HIT');
+            res.setHeader('Content-Type', 'application/json');
+            res.send(cachedData);
+            return;
+        }
+
+        console.log(`[Cache Miss] Fetching ${req.originalUrl} from Backend`);
+        res.setHeader('X-Cache', 'MISS');
+        next();
+    } catch (err) {
+        console.error('Cache Error: ', err);
+        next();
+    }
+};
+
 const startGateway = async () => {
     await redisClient.connect();
     console.log('Connected to Redis');
@@ -103,6 +132,7 @@ const startGateway = async () => {
 
     app.use(authMiddleware);
     app.use(redisRateLimiter);
+    app.use(cacheMiddleware);
 
     const routesRaw = fs.readFileSync('./routes.json', 'utf-8');
     const routes = JSON.parse(routesRaw);
@@ -113,7 +143,8 @@ const startGateway = async () => {
 
         let currentIndex = 0;
         
-        const proxy = createProxyMiddleware({
+        // V3 Migration is a task and a half, keeping it this way for the time being.
+        const proxy = legacyCreateProxyMiddleware({
             target: routeConfig.targets[0],
             changeOrigin: true,
             pathRewrite: { [`^${path}`]: routeConfig.rewritePrefix },
@@ -123,18 +154,28 @@ const startGateway = async () => {
                 console.log(`[Load Balancer] Routing Request to: ${target}`);
                 return target;
             },
-            on: {
-                error: (err, req, res) => {
+            selfHandleResponse: true,
+            onError: (err, req, res) => {
+                breaker.onFailure();
+                const altRes = res as Response; // Courtesy http-proxy-middleware version 3.x
+                altRes.status(502).json({ error: 'I have consulted the gateway. It has failed us.' });
+            },
+            onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req: Request, res) => {
+                if (proxyRes.statusCode && proxyRes.statusCode >= 500) {
                     breaker.onFailure();
-                    const altRes = res as Response; // Courtesy http-proxy-middleware version 3.x
-                    altRes.status(502).json({ error: 'I have consulted the gateway. It has failed us.' });
-                },
-                proxyRes: (proxyRes, req, res) => {
-                    if (proxyRes.statusCode && proxyRes.statusCode >= 500) breaker.onFailure();
-                    else breaker.onSuccess();
+                } else {
+                    breaker.onSuccess();
                 }
-            }
-            
+
+                if (proxyRes.statusCode === 200 && req.method === 'GET') {
+                    const responseString = responseBuffer.toString('utf8');
+                    const cacheKey = `cache:${req.originalUrl}`;
+
+                    await redisClient.setEx(cacheKey, CACHE_TTL, responseString);
+                    console.log(`[Cache Stored] Saved Response for ${req.originalUrl}`);
+                }
+                return responseBuffer;
+            })
         });
 
         app.use(path, breaker.middleware, proxy);
